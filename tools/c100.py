@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import os
 import shutil
 import struct
 import subprocess
@@ -28,7 +29,7 @@ ROOT = Path(__file__).resolve().parents[1]
 VAULT = ROOT / "firmware" / "ORIGINAL" / "gp_cardvr_upgrade.bin"
 MEOW_BIN = ROOT / "firmware" / "gp_cardvr_upgrade.MEOW.bin"
 MUTE_BIN = ROOT / "firmware" / "gp_cardvr_upgrade.MUTED.bin"
-EXPECTED_ORIG = "769733179a81f943c300c4e1a49cec95ff9d2c793618fe037fc8575e95279b64"
+EXPECTED_ORIG = "f86b8c1c47b3ee29c494d38ecd5a5300cf36b2156a29d5aecb11f8a73ce922a3"
 FW_SIZE = 1841152
 CARD_CANDIDATES = ("Untitled 2", "Untitled", "NO NAME", "GODDX")
 FLASH_HELP = (
@@ -62,28 +63,54 @@ def sha256(p: Path) -> str:
     return hashlib.sha256(p.read_bytes()).hexdigest()
 
 
-def find_card() -> Path | None:
+def _candidate_roots() -> list[Path]:
+    if sys.platform == "win32":
+        import ctypes
+        DRIVE_REMOVABLE = 2
+        seen: list[Path] = []
+        for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
+            root = Path(f"{letter}:\\")
+            if ctypes.windll.kernel32.GetDriveTypeW(str(root)) == DRIVE_REMOVABLE:
+                seen.append(root)
+        return seen
     vols = Path("/Volumes")
     if not vols.is_dir():
-        return None
-    named = []
-    for name in CARD_CANDIDATES:
-        p = vols / name
-        if p.is_dir():
-            named.append(p)
-    for p in list(vols.iterdir()) + named:
+        return []
+    named = [vols / name for name in CARD_CANDIDATES if (vols / name).is_dir()]
+    return list(vols.iterdir()) + named
+
+
+def find_card() -> Path | None:
+    for p in _candidate_roots():
         if p.is_dir() and (p / "RESTORE_ORIGINAL.bin").is_file():
             return p
-    for p in named:
-        if p.is_dir():
-            return p
+    for p in _candidate_roots():
+        for name in CARD_CANDIDATES:
+            if sys.platform == "win32":
+                label = _win_drive_label(p)
+                if label and label.upper() in [n.upper() for n in CARD_CANDIDATES]:
+                    return p
+            elif p.name in CARD_CANDIDATES:
+                return p
     return None
+
+
+def _win_drive_label(root: Path) -> str | None:
+    try:
+        import ctypes
+        buf = ctypes.create_unicode_buffer(256)
+        ctypes.windll.kernel32.GetVolumeInformationW(
+            str(root), buf, len(buf), None, None, None, None, 0
+        )
+        return buf.value or None
+    except Exception:
+        return None
 
 
 def require_card() -> Path:
     card = find_card()
     if card is None:
-        raise SystemExit("camera card not mounted (expected RESTORE_ORIGINAL.bin under /Volumes)")
+        raise SystemExit("camera card not mounted (expected RESTORE_ORIGINAL.bin on a removable drive)")
     return card
 
 
@@ -102,18 +129,40 @@ def stage_image(img: bytes, label: str, *, eject: bool) -> None:
     require_restore(card)
     dest = card / "gp_cardvr_upgrade.bin"
     dest.write_bytes(img)
-    subprocess.check_call(["sync"])
+    try:
+        with open(dest, "rb") as fh:
+            os.fsync(fh.fileno())
+    except OSError:
+        pass
     if hashlib.sha256(dest.read_bytes()).digest() != hashlib.sha256(img).digest():
         dest.unlink(missing_ok=True)
         raise SystemExit("staged hash mismatch — removed the upgrade file")
     print(f"staged {label}  {hashlib.sha256(img).hexdigest()}")
     print(f"RESTORE left on {card / 'RESTORE_ORIGINAL.bin'}")
     if eject:
-        try:
-            subprocess.check_call(["diskutil", "eject", str(card)])
+        ejected = False
+        if sys.platform == "win32":
+            try:
+                letter = str(card)[:2]
+                subprocess.check_call(
+                    ["powershell", "-NoProfile", "-Command",
+                     f"(New-Object -comObject Shell.Application)"
+                     f".Namespace(17).ParseName('{letter}').InvokeVerb('Eject')"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+                ejected = True
+            except (subprocess.CalledProcessError, FileNotFoundError):
+                pass
+        else:
+            try:
+                subprocess.check_call(["diskutil", "eject", str(card)])
+                ejected = True
+            except (subprocess.CalledProcessError, FileNotFoundError):
+                pass
+        if ejected:
             print("ejected")
-        except (subprocess.CalledProcessError, FileNotFoundError):
-            print("eject the card in Finder, then flash")
+        else:
+            print("eject the card manually, then flash")
     print(FLASH_HELP)
 
 
@@ -444,8 +493,8 @@ def patch_slots(
 
 # play() opens these names at boot. TEST.WAV is 1.25 s and nothing uses it.
 _PLAY_NAME = {
-    "shutter": (0xE0D70, b"CAMERA.WAV"),
-    "poweron": (0xE0D88, b"POWERON_AUDIO.WAV"),
+    "shutter": (0xE1B80, b"CAMERA.WAV"),
+    "poweron": (0xE1B98, b"POWERON_AUDIO.WAV"),
 }
 
 
